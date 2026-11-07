@@ -9,6 +9,11 @@ import re
 
 from pocket_tts.modules.text_conditioner import Tokenizer
 
+try:
+    from pocket_tts.models.text_normalizer import normalize_text_for_tts
+except Exception:  # pragma: no cover
+    normalize_text_for_tts = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,8 +24,11 @@ def prepare_text_prompt(
     append_terminal_punctuation: bool = True,
     capitalize_first_letter: bool = True,
     replace_characters: dict[str, str] | None = None,
+    normalize_text: bool = False,
 ) -> tuple[str, int]:
     text = text.strip()
+    if normalize_text and normalize_text_for_tts is not None:
+        text = normalize_text_for_tts(text)
     if replace_characters:
         text = " ".join(text.translate(str.maketrans(replace_characters)).split())
         # Deleted quotes leave '"Hi?", she said' as 'Hi?, she said', which reads as a sentence end
@@ -163,6 +171,7 @@ def split_into_best_sentences(
     append_terminal_punctuation: bool = True,
     capitalize_first_letter: bool = True,
     replace_characters: dict[str, str] | None = None,
+    normalize_text: bool = False,
 ) -> list[str]:
     text_to_generate, _ = prepare_text_prompt(
         text_to_generate,
@@ -171,6 +180,7 @@ def split_into_best_sentences(
         append_terminal_punctuation,
         capitalize_first_letter,
         replace_characters,
+        normalize_text=normalize_text,
     )
     text_to_generate = text_to_generate.strip()
     tokens = tokenizer(text_to_generate)

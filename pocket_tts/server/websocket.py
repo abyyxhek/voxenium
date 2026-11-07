@@ -79,11 +79,11 @@ def register_websocket_routes(app: FastAPI) -> None:
                 raise ValueError("voice must start with http://, https://, hf://, or be a predefined voice name")
             return model._cached_get_state_for_audio_prompt(voice)
 
-        def generation_worker(text: str, voice: str | None) -> None:
+        def generation_worker(text: str, voice: str | None, speed: float = 1.0) -> None:
             try:
                 model_state = resolve_voice_state(voice)
                 for chunk in model.generate_audio_stream(
-                    model_state=model_state, text_to_generate=text, stop=stop
+                    model_state=model_state, text_to_generate=text, stop=stop, speed=speed
                 ):
                     if stop.is_set():
                         break
@@ -128,8 +128,16 @@ def register_websocket_routes(app: FastAPI) -> None:
                     text = payload.get("text")
                     voice = payload.get("voice")
                     flush = payload.get("flush", True)
+                    speed = payload.get("speed", 1.0)
+                    try:
+                        speed = float(speed)
+                    except Exception:
+                        speed = 1.0
                     if voice is not None and not isinstance(voice, str):
                         await send_json({"error": "voice must be a string"})
+                        continue
+                    if not isinstance(speed, (int, float)):
+                        await send_json({"error": "speed must be a number"})
                         continue
                     if text is None:
                         if flush and worker and worker.is_alive():
@@ -145,7 +153,7 @@ def register_websocket_routes(app: FastAPI) -> None:
 
                     stop.clear()
                     worker = threading.Thread(
-                        target=generation_worker, args=(text, voice), daemon=True
+                        target=generation_worker, args=(text, voice, speed), daemon=True
                     )
                     worker.start()
                 elif "bytes" in msg and msg["bytes"] is not None:

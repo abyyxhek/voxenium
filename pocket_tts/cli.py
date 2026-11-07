@@ -192,6 +192,10 @@ def generate(
     quantize: Annotated[
         bool, typer.Option(help="Apply int8 quantization to reduce memory usage")
     ] = False,
+    speed: Annotated[float, typer.Option(help="Speech rate multiplier (0.5-2.0)")] = 1.0,
+    normalize_text: Annotated[
+        bool, typer.Option(help="Apply intelligent text normalization (numbers/currency/abbreviations)")
+    ] = True,
 ):
     """Generate speech using Kyutai Pocket TTS."""
     if lsd_decode_steps is not None:
@@ -228,6 +232,8 @@ def generate(
             frames_after_eos=frames_after_eos,
             max_tokens=max_tokens,
             teacher_force_previous_chunk=teacher_force_previous_chunk,
+            speed=speed,
+            normalize_text=normalize_text,
         )
 
         stream_audio_chunks(output_path, audio_chunks, tts_model.config.mimi.sample_rate)

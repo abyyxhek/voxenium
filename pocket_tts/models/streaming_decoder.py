@@ -9,6 +9,7 @@ import torch
 
 from pocket_tts.models.flow_lm import FlowLMModel
 from pocket_tts.models.mimi import MimiModel
+from pocket_tts.models.prosody import apply_speed, clamp_speed
 from pocket_tts.modules.stateful_module import increment_steps, init_states
 from pocket_tts.utils.config import Config
 
@@ -35,10 +36,12 @@ def decode_audio_worker(
     mimi_sequence_length: int,
     mimi_steps_per_latent: int,
     warmup_latents: torch.Tensor | None = None,
+    speed: float = 1.0,
 ) -> None:
     """Worker thread function for decoding audio latents from queue with immediate streaming."""
     try:
         audio_chunks = []
+        speed = clamp_speed(speed)
         mimi_state = init_states(mimi, batch_size=1, sequence_length=mimi_sequence_length)
         # A fresh Mimi decoder state puts a small step (about -41 dBFS) in its first samples, heard
         # as a click at the start of every chunk: fade the first 5 ms in. (The longer burst some
@@ -79,6 +82,8 @@ def decode_audio_worker(
                 n = min(fade_in.numel(), audio_frame.shape[-1])
                 audio_frame[..., :n] *= fade_in[:n].to(audio_frame)
                 fade_in = None
+            if speed != 1.0:
+                audio_frame = apply_speed(audio_frame, speed)
             increment_steps(mimi, mimi_state, increment=mimi_steps_per_latent * len(latents))
             audio_frame_duration = audio_frame.shape[2] / config.mimi.sample_rate
             logger.debug(

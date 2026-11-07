@@ -39,6 +39,9 @@ from pocket_tts.models.model_loader import (
 from pocket_tts.models.model_state import _is_safetensors_source  # noqa: F401
 from pocket_tts.models.streaming_decoder import _DECODER_WARMUP_FRAMES, decode_audio_worker
 from pocket_tts.models.text_chunking import prepare_text_prompt, split_into_best_sentences
+from pocket_tts.models.text_normalizer import normalize_text_for_tts
+from pocket_tts.models.prosody import clamp_speed
+from pocket_tts.models.style_tags import apply_style_to_params, parse_style_tags
 from pocket_tts.models.voice_processor import (
     VOICE_CLONING_UNSUPPORTED,  # noqa: F401
     _cached_get_state_for_audio_prompt,
@@ -328,6 +331,7 @@ class TTSModel(nn.Module):
         mimi_sequence_length: int,
         mimi_steps_per_latent: int,
         warmup_latents: torch.Tensor | None = None,
+        speed: float = 1.0,
     ) -> None:
         """Worker thread function for decoding audio latents from queue with immediate streaming."""
         decode_audio_worker(
@@ -340,6 +344,7 @@ class TTSModel(nn.Module):
             mimi_sequence_length=mimi_sequence_length,
             mimi_steps_per_latent=mimi_steps_per_latent,
             warmup_latents=warmup_latents,
+            speed=speed,
         )
 
     @torch.no_grad
@@ -351,6 +356,8 @@ class TTSModel(nn.Module):
         frames_after_eos: int | None = None,
         copy_state: bool = True,
         teacher_force_previous_chunk: bool = False,
+        speed: float = 1.0,
+        normalize_text: bool = True,
     ) -> torch.Tensor:
         """Generate complete audio tensor from text input.
 
@@ -416,6 +423,8 @@ class TTSModel(nn.Module):
             copy_state=copy_state,
             max_tokens=max_tokens,
             teacher_force_previous_chunk=teacher_force_previous_chunk,
+            speed=speed,
+            normalize_text=normalize_text,
         ):
             audio_chunks.append(chunk)
         return torch.cat(audio_chunks, dim=0)
@@ -430,6 +439,8 @@ class TTSModel(nn.Module):
         copy_state: bool = True,
         stop: threading.Event | None = None,
         teacher_force_previous_chunk: bool = False,
+        speed: float = 1.0,
+        normalize_text: bool = True,
     ) -> Iterator[torch.Tensor]:
         """Generate audio streaming chunks from text input.
 
@@ -496,7 +507,23 @@ class TTSModel(nn.Module):
             frames_after_eos = self.model_recommended_frames_after_eos
         if stop is None:
             stop = threading.Event()
+        speed = clamp_speed(speed)
 
+        style = parse_style_tags(text_to_generate)
+        text_to_generate_proc = style.text or text_to_generate
+        # Apply style overrides (speed factor from style tag)
+        _t2, _n2, speed = apply_style_to_params(self.temp, self.noise_clamp, speed, style)
+        speed = clamp_speed(speed)
+        orig_temp, orig_noise = self.temp, self.noise_clamp
+        if _t2 is not None:
+            self.temp = _t2
+        if _n2 is not None:
+            self.noise_clamp = _n2
+        if normalize_text:
+            try:
+                text_to_generate_proc = normalize_text_for_tts(text_to_generate_proc)
+            except Exception:
+                pass
         if max_tokens is None:
             max_tokens = (
                 MAX_TOKEN_PER_CHUNK_TEACHER_FORCED
@@ -507,55 +534,60 @@ class TTSModel(nn.Module):
         # voice prompt; with teacher_force_previous_chunk it continues the previous one.
         chunks = split_into_best_sentences(
             self.flow_lm.conditioner.tokenizer,
-            text_to_generate,
+            text_to_generate_proc,
             max_tokens,
             self.pad_with_spaces_for_short_inputs,
             remove_semicolons=self.remove_semicolons,
             append_terminal_punctuation=self.append_terminal_punctuation,
             capitalize_first_letter=self.capitalize_first_letter,
             replace_characters=self.replace_characters,
+            normalize_text=False,
         )
-
-        prev_chunk: str | None = None
-        prev_latents: list[torch.Tensor] = []
-        for chunk in chunks:
-            if stop.is_set():
-                break
-            forced, text_chunk = None, chunk
-            if teacher_force_previous_chunk and prev_latents:
-                forced = torch.cat(prev_latents, dim=1)
-                text_chunk = f"{prev_chunk} {chunk}"
-            prev_chunk, prev_latents = chunk, []
-            text_to_generate, _ = prepare_text_prompt(
-                text_chunk,
-                self.pad_with_spaces_for_short_inputs,
-                self.remove_semicolons,
-                self.append_terminal_punctuation,
-                self.capitalize_first_letter,
-                self.replace_characters,
-            )
-            # The EOS delay depends on the new chunk only.
-            _, frames_after_eos_guess = prepare_text_prompt(
-                chunk,
-                self.pad_with_spaces_for_short_inputs,
-                self.remove_semicolons,
-                self.append_terminal_punctuation,
-                self.capitalize_first_letter,
-                self.replace_characters,
-            )
-            frames_after_eos_guess += 2
-            effective_frames = (
-                frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
-            )
-            yield from self._generate_audio_stream_short_text(
-                model_state=model_state,
-                text_to_generate=text_to_generate,
-                frames_after_eos=effective_frames,
-                copy_state=copy_state or teacher_force_previous_chunk,
-                stop=stop,
-                latents_out=prev_latents if teacher_force_previous_chunk else None,
-                forced_latents=forced,
-            )
+        try:
+            prev_chunk: str | None = None
+            prev_latents: list[torch.Tensor] = []
+            for chunk in chunks:
+                if stop.is_set():
+                    break
+                forced, text_chunk = None, chunk
+                if teacher_force_previous_chunk and prev_latents:
+                    forced = torch.cat(prev_latents, dim=1)
+                    text_chunk = f"{prev_chunk} {chunk}"
+                prev_chunk, prev_latents = chunk, []
+                text_to_generate, _ = prepare_text_prompt(
+                    text_chunk,
+                    self.pad_with_spaces_for_short_inputs,
+                    self.remove_semicolons,
+                    self.append_terminal_punctuation,
+                    self.capitalize_first_letter,
+                    self.replace_characters,
+                )
+                # The EOS delay depends on the new chunk only.
+                _, frames_after_eos_guess = prepare_text_prompt(
+                    chunk,
+                    self.pad_with_spaces_for_short_inputs,
+                    self.remove_semicolons,
+                    self.append_terminal_punctuation,
+                    self.capitalize_first_letter,
+                    self.replace_characters,
+                )
+                frames_after_eos_guess += 2 + getattr(style, "frames_after_eos_bias", 0)
+                effective_frames = (
+                    frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
+                )
+                for _chunk in self._generate_audio_stream_short_text(
+                    model_state=model_state,
+                    text_to_generate=text_to_generate,
+                    frames_after_eos=effective_frames,
+                    copy_state=copy_state or teacher_force_previous_chunk,
+                    stop=stop,
+                    latents_out=prev_latents if teacher_force_previous_chunk else None,
+                    forced_latents=forced,
+                    speed=speed,
+                ):
+                    yield _chunk
+        finally:
+            self.temp, self.noise_clamp = orig_temp, orig_noise
 
     @torch.no_grad
     def _generate_audio_stream_short_text(
@@ -567,6 +599,7 @@ class TTSModel(nn.Module):
         stop: threading.Event,
         latents_out: list[torch.Tensor] | None = None,
         forced_latents: torch.Tensor | None = None,
+        speed: float = 1.0,
     ) -> Iterator[torch.Tensor]:
         if copy_state:
             model_state = copy.deepcopy(model_state)
@@ -589,7 +622,14 @@ class TTSModel(nn.Module):
         # Start decoder worker thread
         decoder_thread = threading.Thread(
             target=self._decode_audio_worker,
-            args=(latents_queue, result_queue, mimi_sequence_length, mimi_steps_per_latent, warmup),
+            args=(
+                latents_queue,
+                result_queue,
+                mimi_sequence_length,
+                mimi_steps_per_latent,
+                warmup,
+                speed,
+            ),
             daemon=True,
         )
         logger.info("starting timer now!")
